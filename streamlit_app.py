@@ -6,7 +6,7 @@ st.caption("a.k.a. Geologists' input")
 
 # tabs
 
-tab1, = st.tabs(["Chunks"])
+tab1, = st.tabs(["Chunking"])
 
 with tab1:
     st.markdown("""
