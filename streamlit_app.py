@@ -2,7 +2,7 @@ import streamlit as st
 
 # title
 st.title("Terrafusion25\ngrading model outputs")
-st.subheader(a.k.a. Geologists' input")
+st.subheader("a.k.a. Geologists' input")
 st.divider()
 
 # tabs
