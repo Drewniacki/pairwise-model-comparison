@@ -9,8 +9,8 @@ st.caption("a.k.a. Geologists' input")
 tab1, = st.tabs(["Chunks"])
 
 with tab1:
-    st.markdown(
-        "- Chunk size 
+    st.markdown("""
+- Chunk size 
   - right
   - too small
   - too big
@@ -26,5 +26,4 @@ with tab1:
 
 Comment 
 
-General observation "
-    )
+General observation """)
