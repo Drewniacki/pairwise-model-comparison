@@ -1,5 +1,7 @@
 import streamlit as st
-from db import get_random_chunk, get_chunk_by_uuid, get_adjacent_chunk, count_chunks_in_document, insert_chunk_review
+from db import get_random_chunk, get_chunk_by_uuid, get_adjacent_chunk, get_similar_chunk, insert_chunk_review
+from db import count_chunks_in_document, total_documents, documents_with_at_least_one_review, total_reviews_by_user
+from db import total_chunks, total_reviews, chunks_with_at_least_one_review, reviewed_chunks_in_this_document
 from form_logic import ChunkForm
 from drive import format_document_link
 
@@ -15,13 +17,10 @@ with tab_chunking:
     # Chunk loading logic
     if ChunkForm.is_submitted():
         if ChunkForm.is_submitted_correctly():
-            st.write("Submitted correctly")
-            chunk = get_random_chunk()
+            chunk = get_similar_chunk(st.session_state.chunk_uuid)
         else:
-            st.write("Submitted")
             chunk = get_chunk_by_uuid(st.session_state.chunk_uuid)
     else:
-        st.write("Clean one")
         chunk = get_random_chunk()
 
 
@@ -52,21 +51,27 @@ with tab_chunking:
                 st.code(next_chunk["text"], language="text")
 
         st.markdown("##### Assigned wells")
-        if chunk['metadata']['has_well']:
-            for well in chunk['metadata']['wells']:
+        if chunk['has_well']:
+            for well in chunk['wells']:
                 st.markdown('- '+well)
         else:
             st.write('*None*')
 
-        st.markdown("##### Document source")
-        st.write(format_document_link(chunk["metadata"]))
+        source_title = "##### Document source"
+        if ChunkForm.is_submitted_correctly():
+            if chunk['source'] == get_chunk_by_uuid(st.session_state.submitted["chunk_uuid"])['source']:
+                source_title += " :blue-badge[Same as previously assessed]"
+            else:
+                source_title += " :red-badge[New document source!]"
+        st.markdown(source_title)
+        st.write(format_document_link(chunk))
 
         st.markdown("##### Metadata")
-        st.json(chunk["metadata"], expanded=False)
+        st.json(chunk, expanded=False)
 
 
 
-        # grading fields
+        # Asessement fields
         st.subheader("User input", divider="blue")
 
         if ChunkForm.is_submitted() and ChunkForm.has_missing_fields():
@@ -101,8 +106,55 @@ with tab_chunking:
                 inserted = insert_chunk_review(st.session_state.submitted)
                 st.success("Form successfully submitted!")
                 st.write("##### Submitted Data")
-                st.json(inserted)
+                st.json(inserted, expanded=False)
 
+
+        # Stats
+        with st.expander("Stats"):
+            
+            # chunks stat
+            no_chunks = total_chunks()
+            no_reviewed_chunks = chunks_with_at_least_one_review()
+            if no_chunks > 0:
+                pct = no_reviewed_chunks / no_chunks * 100
+                st.write(f"{no_reviewed_chunks} of {no_chunks} chunks reviewed ({pct:.1f}%)")
+            else:
+                st.write("No chunks in database.")
+
+            # documents stats
+            no_documents = total_documents()
+            no_documents_with_reviews = documents_with_at_least_one_review()
+
+            if no_documents > 0:
+                pct_docs = no_documents_with_reviews / no_documents * 100
+                st.write(f"{no_documents_with_reviews} of {no_documents} documents have at least one review ({pct_docs:.1f}%)")
+            else:
+                st.write("No documents found.")
+
+            
+            # documents chunk stats
+            no_document_reviews = reviewed_chunks_in_this_document(st.session_state.chunk_uuid)
+            no_chunks_in_doc = count_chunks_in_document(st.session_state.chunk_uuid)
+            if no_chunks_in_doc > 0:
+                pct_doc = no_document_reviews / no_chunks_in_doc * 100
+                st.write(f"{no_document_reviews} of {no_chunks_in_doc} chunks in *current document* reviewed ({pct_doc:.1f}%)")
+            else:
+                st.write("This document has no chunks (strange universe, but we acknowledge it).")
+
+            # user stats
+            if "name" in st.session_state and st.session_state.name:
+                no_reviews = total_reviews()
+                user_reviews = total_reviews_by_user(st.session_state.name)
+                if no_reviews > 0:
+                    pct_user = user_reviews / no_reviews * 100
+                    st.write(f"{user_reviews} of {no_reviews} were submitted by You (**{st.session_state.name}**) ({pct_user:.1f}%)")
+                    # st.write(
+                    #     f"You (**{st.session_state.name}**) have submitted "
+                    #     f"**{user_reviews}** of **{no_reviews}** reviews "
+                    #     f"({pct_user:.1f}%)"
+                    # )
+                else:
+                    st.write("There are no reviews")
 
     else:
         st.warning("No chunks found in database.")
