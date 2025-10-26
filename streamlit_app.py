@@ -1,5 +1,5 @@
 import streamlit as st
-from db import get_random_chunk, get_chunk_by_uuid, get_adjacent_chunk, count_chunks_in_document
+from db import get_random_chunk, get_chunk_by_uuid, get_adjacent_chunk, count_chunks_in_document, insert_chunk_review
 from form_logic import ChunkForm
 from drive import format_document_link
 
@@ -13,8 +13,8 @@ tab_chunking, = st.tabs(["Chunking"])
 with tab_chunking:
     
     # Chunk loading logic
-    if ChunkForm.submitted():
-        if ChunkForm.submitted_correctly():
+    if ChunkForm.is_submitted():
+        if ChunkForm.is_submitted_correctly():
             st.write("Submitted correctly")
             chunk = get_random_chunk()
         else:
@@ -43,7 +43,7 @@ with tab_chunking:
         st.markdown("##### Chunk content")
         document_chunk_count = count_chunks_in_document(st.session_state.chunk_uuid)
         chunk_number = chunk["chunk_number"]
-        st.write(f"this is chunk no. {chunk_number} of {document_chunk_count} in the document")
+        st.write(f"this is chunk no **{chunk_number} of {document_chunk_count}** in this document")
         st.code(chunk["text"], language="text")
 
         next_chunk = get_adjacent_chunk(st.session_state.chunk_uuid, direction = "next")
@@ -69,22 +69,22 @@ with tab_chunking:
         # grading fields
         st.subheader("User input", divider="blue")
 
-        if ChunkForm.submitted() and ChunkForm.has_missing_fields():
+        if ChunkForm.is_submitted() and ChunkForm.has_missing_fields():
             st.error(f"Please fill in all required fields: {', '.join(st.session_state.missing_fields)}")
 
         # 📋 Create a form
         with st.form("chunk_form"):
 
             name = st.selectbox("**Assesor**", 
-                                options=[""] + ChunkForm.NAME_OPTIONS, key="name")
+                                options=ChunkForm.NAME_OPTIONS, key="name", index=None)
             chunk_size = st.selectbox("**Chunk Size**\n\nHow does the size of this chunk feel? Does it represent the right portion of the document? Does this chunk capture a natural section of the document, or does it cut off mid-idea?", 
-                                      options=[""] + ChunkForm.CHUNK_SIZE_OPTIONS, key="chunk_size")
+                                      options=ChunkForm.CHUNK_SIZE_OPTIONS, key="chunk_size", index=None)
             well_assignment = st.multiselect("**Well Assignment Accuracy**\n\nDoes the well (or wells) automatically assigned to this chunk match what’s actually referenced in the text?", 
-                                           options=[""] + ChunkForm.WELL_ASSIGNMENT_OPTIONS, key="well_assignment")
+                                           options=ChunkForm.WELL_ASSIGNMENT_OPTIONS, key="well_assignment", default=None)
             chunk_info = st.selectbox("**Chunk Information**\n\nWhen compared to the original document, is the information here complete? Is anything missing or incorrectly included?", 
-                                      options=[""] + ChunkForm.CHUNK_INFO_OPTIONS, key="chunk_info")
+                                      options=ChunkForm.CHUNK_INFO_OPTIONS, key="chunk_info", index=None)
             has_well_diagram = st.selectbox("**Includes Well Diagram?**\n\nDoes this part of the original document include a well diagram or visual reference that the model should recognize?", 
-                                            options=[""] + ChunkForm.WELL_DIAGRAM_OPTIONS, key="well_diagram")
+                                            options=ChunkForm.WELL_DIAGRAM_OPTIONS, key="has_well_diagram", index=None)
 
             comment = st.text_area("**Comment** (optional)", key="comment")
             observation = st.text_area("**General Observation** (optional)\n\nAny broader insights from reviewing multiple chunks so far? Patterns, recurring issues, improvements noticed, etc.", 
@@ -97,19 +97,12 @@ with tab_chunking:
 
         # ✅ Process the form data if submitted
         if submitted:
-            if ChunkForm.submitted_correctly():
+            if ChunkForm.is_submitted_correctly():
+                inserted = insert_chunk_review(st.session_state.submitted)
                 st.success("Form successfully submitted!")
                 st.write("##### Submitted Data")
-                st.json({
-                    "Name": st.session_state.name,
-                    "Chunk Size": st.session_state.chunk_size,
-                    "Well Assignment": st.session_state.well_assignment,
-                    "Chunk Information": st.session_state.chunk_info,
-                    "Includes Well Diagram": st.session_state.well_diagram,
-                    "Comment": st.session_state.comment,
-                    "General Observation": st.session_state.observation,
-                    "Chunk UUID": st.session_state.chunk_uuid
-                })
+                st.json(inserted)
+
 
     else:
         st.warning("No chunks found in database.")

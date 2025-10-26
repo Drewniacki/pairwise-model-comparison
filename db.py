@@ -143,3 +143,48 @@ def count_chunks_in_document(chunk_uuid: str):
     # PostgREST returns .count, not in data
     total = getattr(count_resp, "count", None)
     return total or 0
+
+def _to_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    return s in {"yes", "y", "true", "1", "t"}
+
+def insert_chunk_review(form_payload: dict):
+    """
+    Insert a review row from the Streamlit form payload.
+    Expected payload shape:
+    {
+      "chunk_uuid": "uuid-string",
+      "name": "Krzysiek",
+      "chunk_size": "too big",
+      "chunk_info": "missing information",
+      "has_well_diagram": "No",
+      "comment": "asdsad",
+      "observation": "dfghsfgh",
+      "well_assignment": ["the assigned well is not mentioned in the text"]
+    }
+    Returns inserted row dict (or raises on error).
+    """
+    if not form_payload or "chunk_uuid" not in form_payload:
+        raise ValueError("chunk_uuid is required")
+
+    row = {
+        "chunk_uuid": form_payload.get("chunk_uuid"),
+        "name": form_payload.get("name"),
+        "chunk_size": form_payload.get("chunk_size"),
+        "chunk_info": form_payload.get("chunk_info"),
+        "has_well_diagram": _to_bool(form_payload.get("has_well_diagram")),
+        "comment": form_payload.get("comment"),
+        "observation": form_payload.get("observation"),
+        "well_assignment": form_payload.get("well_assignment") or [],
+        # inserted_at is server-side default (now()), no need to send
+    }
+
+    resp = supabase.table("chunk_reviews").insert(row).execute()
+    # Supabase returns inserted rows in resp.data
+    if not resp.data:
+        raise RuntimeError("Insert failed with no data returned")
+    return resp.data[0]
