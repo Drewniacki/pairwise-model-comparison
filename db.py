@@ -14,13 +14,7 @@ def get_random_chunk():
     Fetch one random chunk from the database.
     Returns a dict or None.
     """
-    resp = (
-        supabase.table("document_chunks")
-        .select("*")
-        .order("random()")
-        .limit(1)
-        .execute()
-    )
+    resp = supabase.rpc("get_random_chunk").execute()
 
     if resp.data:
         return resp.data[0]
