@@ -67,7 +67,7 @@ with tab_chunking:
         st.write(format_document_link(chunk))
 
         st.markdown("##### Metadata")
-        st.json(chunk, expanded=False)
+        st.json({k: v for k, v in chunk.items() if k != "text"}, expanded=False)
 
 
 
