@@ -1,67 +1,115 @@
 import streamlit as st
-from db import get_random_chunk
+from db import get_random_chunk, get_chunk_by_uuid, get_adjacent_chunk, count_chunks_in_document
+from form_logic import ChunkForm
+from drive import format_document_link
 
 # title
-st.title("Terrafusion25: grading model outputs")
-# st.caption("a.k.a. Geologists' input")
+st.title("Terrafusion25: assessing model outputs")
 
 # tabs
 
 tab_chunking, = st.tabs(["Chunking"])
 
 with tab_chunking:
+    
+    # Chunk loading logic
+    if ChunkForm.submitted():
+        if ChunkForm.submitted_correctly():
+            st.write("Submitted correctly")
+            chunk = get_random_chunk()
+        else:
+            st.write("Submitted")
+            chunk = get_chunk_by_uuid(st.session_state.chunk_uuid)
+    else:
+        st.write("Clean one")
+        chunk = get_random_chunk()
 
-    chunk = get_random_chunk()
+
+    
 
     if chunk:
-        st.subheader("Chunk Text")
-        st.write(chunk["text"])
-
-        st.subheader("Metadata")
-        st.json(chunk["metadata"])
-
-        st.caption(f"Chunk UUID: {chunk['chunk_uuid']}")
-        st.caption(f"Chunk Number: {chunk['chunk_number']}")
-        st.caption(f"Run ID: {chunk['chunking_run_id']}")
-    else:
-        st.warning("No chunks found in database.")
-
-    st.markdown("""
-- Chunk size 
-  - right
-  - too small
-  - too big
-- Well assignment
-  - Correct
-  - no wells assigned but chunk refers to the well
-  - incorrect well assigned
-  - multiple wells assigned including correct and not correct one
-- Chunk information 
-  - processed correctly 
-  - missing information 
-  - hallucinated 
-- Cunk includes well diagram? 
-  - Yes/No
+        # check if clean load or submitted
+        ChunkForm.set_session(chunk)
         
 
-Comment 
+        # present chunk information
+        st.subheader("Chunk", divider="orange")
+        
+        previous_chunk = get_adjacent_chunk(st.session_state.chunk_uuid, direction = "prev")
+        if previous_chunk:
+            with st.expander("previous chunk:  *[for info only]*"):
+                st.code(previous_chunk["text"], language="text")
 
-General observation """)
+        st.markdown("##### Chunk content")
+        document_chunk_count = count_chunks_in_document(st.session_state.chunk_uuid)
+        chunk_number = chunk["chunk_number"]
+        st.write(f"this is chunk no. {chunk_number} of {document_chunk_count} in the document")
+        st.code(chunk["text"], language="text")
 
-    # st.header("🎲 Random Chunk Viewer")
+        next_chunk = get_adjacent_chunk(st.session_state.chunk_uuid, direction = "next")
+        if next_chunk:
+            with st.expander("next chunk:  *[for info only]*"):
+                st.code(next_chunk["text"], language="text")
 
-    # if st.button("Get random chunk"):
-    #     chunk = get_random_chunk()
+        st.markdown("##### Assigned wells")
+        if chunk['metadata']['has_well']:
+            for well in chunk['metadata']['wells']:
+                st.markdown('- '+well)
+        else:
+            st.write('*None*')
 
-    #     if chunk:
-    #         st.subheader("Chunk Text")
-    #         st.write(chunk["text"])
+        st.markdown("##### Document source")
+        st.write(format_document_link(chunk["metadata"]))
 
-    #         st.subheader("Metadata")
-    #         st.json(chunk["metadata"])
+        st.markdown("##### Metadata")
+        st.json(chunk["metadata"], expanded=False)
 
-    #         st.caption(f"Chunk UUID: {chunk['chunk_uuid']}")
-    #         st.caption(f"Chunk Number: {chunk['chunk_number']}")
-    #         st.caption(f"Run ID: {chunk['chunking_run_id']}")
-    #     else:
-    #         st.warning("No chunks found in database.")
+
+
+        # grading fields
+        st.subheader("User input", divider="blue")
+
+        if ChunkForm.submitted() and ChunkForm.has_missing_fields():
+            st.error(f"Please fill in all required fields: {', '.join(st.session_state.missing_fields)}")
+
+        # 📋 Create a form
+        with st.form("chunk_form"):
+
+            name = st.selectbox("**Assesor**", 
+                                options=[""] + ChunkForm.NAME_OPTIONS, key="name")
+            chunk_size = st.selectbox("**Chunk Size**\n\nHow does the size of this chunk feel? Does it represent the right portion of the document? Does this chunk capture a natural section of the document, or does it cut off mid-idea?", 
+                                      options=[""] + ChunkForm.CHUNK_SIZE_OPTIONS, key="chunk_size")
+            well_assignment = st.multiselect("**Well Assignment Accuracy**\n\nDoes the well (or wells) automatically assigned to this chunk match what’s actually referenced in the text?", 
+                                           options=[""] + ChunkForm.WELL_ASSIGNMENT_OPTIONS, key="well_assignment")
+            chunk_info = st.selectbox("**Chunk Information**\n\nWhen compared to the original document, is the information here complete? Is anything missing or incorrectly included?", 
+                                      options=[""] + ChunkForm.CHUNK_INFO_OPTIONS, key="chunk_info")
+            has_well_diagram = st.selectbox("**Includes Well Diagram?**\n\nDoes this part of the original document include a well diagram or visual reference that the model should recognize?", 
+                                            options=[""] + ChunkForm.WELL_DIAGRAM_OPTIONS, key="well_diagram")
+
+            comment = st.text_area("**Comment** (optional)", key="comment")
+            observation = st.text_area("**General Observation** (optional)\n\nAny broader insights from reviewing multiple chunks so far? Patterns, recurring issues, improvements noticed, etc.", 
+                                       key="observation")
+            
+            # Submit button inside the form
+            submitted = st.form_submit_button("Submit", on_click=ChunkForm.onclick)
+
+            
+
+        # ✅ Process the form data if submitted
+        if submitted:
+            if ChunkForm.submitted_correctly():
+                st.success("Form successfully submitted!")
+                st.write("##### Submitted Data")
+                st.json({
+                    "Name": st.session_state.name,
+                    "Chunk Size": st.session_state.chunk_size,
+                    "Well Assignment": st.session_state.well_assignment,
+                    "Chunk Information": st.session_state.chunk_info,
+                    "Includes Well Diagram": st.session_state.well_diagram,
+                    "Comment": st.session_state.comment,
+                    "General Observation": st.session_state.observation,
+                    "Chunk UUID": st.session_state.chunk_uuid
+                })
+
+    else:
+        st.warning("No chunks found in database.")
