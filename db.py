@@ -1,35 +1,117 @@
 # db.py
+"""
+Supabase data access for the chunk-review Streamlit app.
+
+Key improvements:
+- Centralized run filter for all CHUNKS_TABLE queries (see get_chunking_run_filter()).
+- Cleaned structure, consistent pagination, and precise docstrings.
+- Review counts intersect with the currently-filtered run's chunks for consistency.
+- Bias-aware selection helpers: prefer unreviewed chunks and low-coverage documents.
+
+Assumptions:
+- `document_chunks_flat` has columns: chunk_uuid (PK), source, chunk_number, chunking_run_id, ...
+- `chunk_reviews` has column: chunk_uuid (FK to flat table).
+"""
+
+from __future__ import annotations
+
 from supabase import create_client
 import streamlit as st
-import os
 import random
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-# ---- Config ----
-CHUNKS_TABLE = "document_chunks_flat"
-REVIEWS_TABLE = "chunk_reviews"
-_PAGE = 1000  # paging window for large tables
-
-# You can load these however you prefer:
-supabase = create_client(
-    st.secrets["SUPABASE_URL"],
-    st.secrets["SUPABASE_KEY"]
-)
-
-# ---------- Chunks ----------
+# ---------- Config ----------
 
 CHUNKS_TABLE = "document_chunks_flat"
 REVIEWS_TABLE = "chunk_reviews"
-_PAGE = 2000  # tune for your data size / Supabase row limits
+_PAGE = 2000  # Tune to balance round-trips vs payload size
+
+# Supabase client (adjust if you prefer env vars)
+supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 
-def _fetch_all_reviewed_chunk_uuids():
-    """Return a set of chunk_uuid that appear in chunk_reviews."""
-    reviewed = set()
+# ---------- Run filter (global constraint applied to CHUNKS_TABLE) ----------
+
+def get_chunking_run_filter() -> Optional[Dict[str, str]]:
+    """
+    Return a dict of column->value filters that must be applied to *all*
+    queries against the CHUNKS_TABLE. Change here to switch runs globally.
+
+    Examples:
+        return {"chunking_run_id": "RUN_2025_10_26"}
+        return {"chunking_run_id": st.session_state.get("RUN_ID")}
+        return None  # disable filtering
+
+    By default: hard-coded example value; set to None if you don't need it.
+    """
+    return {"chunking_run_id": "well_chunks_run0.1"}  # <— change or set to None
+
+
+def _apply_run_filter(q):
+    """
+    Apply get_chunking_run_filter() to a PostgREST query builder
+    (only for CHUNKS_TABLE). No-ops if filter is None.
+    """
+    rf = get_chunking_run_filter()
+    if rf:
+        for col, val in rf.items():
+            q = q.eq(col, val)
+    return q
+
+
+# ---------- Small utilities ----------
+
+def _boolify(value):
+    if value is None or isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    return s in {"yes", "y", "true", "1", "t"}
+
+
+def _get_total_rows_for_chunks_where(filters: Optional[List[Tuple[str, str]]] = None) -> int:
+    """
+    Exact count on CHUNKS_TABLE with optional extra filters.
+    Respects run filter automatically.
+    """
+    q = supabase.table(CHUNKS_TABLE).select("count", count="exact")
+    q = _apply_run_filter(q)
+    if filters:
+        for col, val in filters:
+            q = q.eq(col, val)
+    resp = q.limit(1).execute()
+    return getattr(resp, "count", 0) or 0
+
+
+def _iter_all_chunk_rows(select_cols: str = "*", extra_filters: Optional[List[Tuple[str, str]]] = None):
+    """
+    Yield rows from CHUNKS_TABLE with pagination, respecting the run filter.
+    """
+    start = 0
+    while True:
+        q = supabase.table(CHUNKS_TABLE).select(select_cols)
+        q = _apply_run_filter(q)
+        if extra_filters:
+            for col, val in extra_filters:
+                q = q.eq(col, val)
+        page = q.range(start, start + _PAGE - 1).execute()
+        rows = page.data or []
+        if not rows:
+            break
+        for r in rows:
+            yield r
+        start += _PAGE
+
+
+def _iter_all_review_rows(select_cols: str = "chunk_uuid"):
+    """
+    Yield rows from REVIEWS_TABLE with pagination.
+    (No run filter here; we intersect with the current run's chunks when needed.)
+    """
     start = 0
     while True:
         page = (
             supabase.table(REVIEWS_TABLE)
-            .select("chunk_uuid")
+            .select(select_cols)
             .range(start, start + _PAGE - 1)
             .execute()
         )
@@ -37,50 +119,62 @@ def _fetch_all_reviewed_chunk_uuids():
         if not rows:
             break
         for r in rows:
-            cu = r.get("chunk_uuid")
-            if cu:
-                reviewed.add(cu)
+            yield r
         start += _PAGE
+
+
+def _fetch_all_chunk_uuids_in_run() -> Set[str]:
+    """
+    Return the set of all chunk_uuid that belong to the current run filter.
+    If run filter is None, this returns all chunk_uuids.
+    """
+    uuids: Set[str] = set()
+    for r in _iter_all_chunk_rows(select_cols="chunk_uuid"):
+        cu = r.get("chunk_uuid")
+        if cu:
+            uuids.add(cu)
+    return uuids
+
+
+# ---------- Coverage helpers ----------
+
+def _fetch_all_reviewed_chunk_uuids() -> Set[str]:
+    """
+    Return a set of chunk_uuid that have *at least one* review,
+    limited to the current run (by intersecting with the run's chunk UUIDs).
+    """
+    in_run = _fetch_all_chunk_uuids_in_run()
+    if not in_run:
+        return set()
+
+    reviewed: Set[str] = set()
+    for r in _iter_all_review_rows(select_cols="chunk_uuid"):
+        cu = r.get("chunk_uuid")
+        if cu and cu in in_run:
+            reviewed.add(cu)
     return reviewed
 
 
-def _fetch_all_chunks_source_map():
+def _fetch_all_chunks_source_map() -> Dict[str, List[str]]:
     """
-    Return:
-      - source_to_chunks: dict[source] = [chunk_uuid, ...]
-      - any_chunk_by_uuid: dict[chunk_uuid] = row (minimal fields to fetch full row later if needed)
-    We only need chunk_uuid and source here.
+    Map source -> list of chunk_uuids (for the current run).
     """
-    source_to_chunks = {}
-    start = 0
-    while True:
-        page = (
-            supabase.table(CHUNKS_TABLE)
-            .select("chunk_uuid,source")
-            .range(start, start + _PAGE - 1)
-            .execute()
-        )
-        rows = page.data or []
-        if not rows:
-            break
-        for r in rows:
-            src = r.get("source")
-            cu = r.get("chunk_uuid")
-            if not src or not cu:
-                continue
-            source_to_chunks.setdefault(src, []).append(cu)
-        start += _PAGE
+    source_to_chunks: Dict[str, List[str]] = {}
+    for r in _iter_all_chunk_rows(select_cols="chunk_uuid,source"):
+        src = r.get("source")
+        cu = r.get("chunk_uuid")
+        if not src or not cu:
+            continue
+        source_to_chunks.setdefault(str(src), []).append(cu)
     return source_to_chunks
 
 
-def _weighted_choice_by_coverage(source_to_chunks, reviewed_set, epsilon=1e-6):
+def _weighted_choice_by_coverage(source_to_chunks: Dict[str, List[str]], reviewed_set: Set[str], epsilon: float = 1e-6) -> Optional[str]:
     """
-    Build weights per source = (1 - coverage + epsilon),
-    where coverage = reviewed_chunks_in_source / total_chunks_in_source.
-    Return one chosen source (or None if empty).
+    Choose a source with weight ~ (1 - reviewed_fraction). Favors low-coverage docs.
     """
-    sources = []
-    weights = []
+    sources: List[str] = []
+    weights: List[float] = []
     for src, cu_list in source_to_chunks.items():
         total = len(cu_list)
         if total == 0:
@@ -90,204 +184,156 @@ def _weighted_choice_by_coverage(source_to_chunks, reviewed_set, epsilon=1e-6):
         weight = max(0.0, 1.0 - coverage) + epsilon
         sources.append(src)
         weights.append(weight)
-
     if not sources:
         return None
-    # random.choices handles weights
     return random.choices(sources, weights=weights, k=1)[0]
 
 
-def get_random_chunk():
+def _fetch_row_by_uuid(chunk_uuid: str) -> Optional[dict]:
+    """
+    Fetch full row for a chunk_uuid, respecting the run filter.
+    """
+    q = supabase.table(CHUNKS_TABLE).select("*").eq("chunk_uuid", chunk_uuid).limit(1)
+    q = _apply_run_filter(q)
+    rr = q.execute()
+    return (rr.data or [None])[0]
+
+
+# ---------- Chunk selection ----------
+
+def get_random_chunk() -> Optional[dict]:
     """
     Prefer:
       - chunks that haven't been reviewed,
-      - documents with low coverage.
-    Fallbacks to any chunk if needed.
+      - documents (sources) with low coverage,
+    within the current run filter.
+
     Returns a row dict or None.
     """
-    # Nothing to do if there are no chunks at all
-    count_resp = supabase.table(CHUNKS_TABLE).select("count", count="exact").limit(1).execute()
-    total = getattr(count_resp, "count", 0) or 0
+    total = _get_total_rows_for_chunks_where()
     if total <= 0:
         return None
 
-    # 1) Build reviewed set
     reviewed = _fetch_all_reviewed_chunk_uuids()
-
-    # 2) Build map of source -> chunk_uuids
     source_to_chunks = _fetch_all_chunks_source_map()
     if not source_to_chunks:
         return None
 
-    # 3) Pick a source with weight ~ (1 - coverage)
     chosen_source = _weighted_choice_by_coverage(source_to_chunks, reviewed)
     if not chosen_source:
-        # Fallback to pure random chunk if somehow empty
+        # Fallback: uniform random row within run
         idx = random.randint(0, total - 1)
-        resp = supabase.table(CHUNKS_TABLE).select("*").range(idx, idx).execute()
+        q = supabase.table(CHUNKS_TABLE).select("*")
+        q = _apply_run_filter(q)
+        resp = q.range(idx, idx).execute()
         return (resp.data or [None])[0]
 
-    # 4) Inside chosen source, prefer an unreviewed chunk
+    # Prefer unreviewed within chosen source
     cu_list = source_to_chunks[chosen_source]
     unreviewed = [cu for cu in cu_list if cu not in reviewed]
     target_uuid = random.choice(unreviewed) if unreviewed else random.choice(cu_list)
+    return _fetch_row_by_uuid(target_uuid)
 
-    # 5) Fetch and return the full row
-    row_resp = (
-        supabase.table(CHUNKS_TABLE)
-        .select("*")
-        .eq("chunk_uuid", target_uuid)
-        .limit(1)
-        .execute()
-    )
-    return (row_resp.data or [None])[0]
 
-def get_similar_chunk(chunk_uuid: str):
+def get_similar_chunk(chunk_uuid: str) -> Optional[dict]:
     """
-    Pick a 'similar' chunk with a strong bias toward the same document (same `source`),
-    but not 100%. The bias decreases as the current document's review coverage increases.
-    Preference inside a document: unreviewed chunks first; avoid returning the same chunk.
+    Strong bias toward the same document (same `source`) as `chunk_uuid`,
+    but not 100%. Bias decreases with that document's review coverage.
+    Prefers unreviewed; never returns the same chunk.
+    Respects the current run filter.
 
     Returns a row dict or None.
     """
     if not chunk_uuid:
         return None
 
-    # 0) Fetch current chunk to get its source
-    cur = (
-        supabase.table(CHUNKS_TABLE)
-        .select("source")
-        .eq("chunk_uuid", chunk_uuid)
-        .limit(1)
-        .execute()
-    )
+    # Current chunk's source (must match run)
+    q = supabase.table(CHUNKS_TABLE).select("source").eq("chunk_uuid", chunk_uuid).limit(1)
+    q = _apply_run_filter(q)
+    cur = q.execute()
     if not cur.data:
         return None
-
     current_source = cur.data[0].get("source")
     if not current_source:
         return None
+    current_source = str(current_source)
 
-    # 1) Reviewed set (for coverage & unreviewed preference)
     reviewed = _fetch_all_reviewed_chunk_uuids()
-
-    # 2) Map of source -> chunk_uuids
     source_to_chunks = _fetch_all_chunks_source_map()
-    if not source_to_chunks:
-        return None
-
-    # 3) Coverage for current source
     cu_list = source_to_chunks.get(current_source, [])
     if not cu_list:
         return None
 
     total_in_src = len(cu_list)
     reviewed_in_src = sum(1 for cu in cu_list if cu in reviewed)
-    coverage = reviewed_in_src / total_in_src  # 0.0 .. 1.0
+    coverage = reviewed_in_src / total_in_src
 
-    # 4) Compute probability to stick to same doc.
-    #    - At 0% coverage → ~0.95 (very strong)
-    #    - At 100% coverage → ~0.05 (still possible, but weak)
+    # 0% coverage → ~0.95 stay; 100% → ~0.05
     min_p, max_p = 0.05, 0.95
     p_same = min_p + (max_p - min_p) * (1.0 - coverage)
 
-    def _fetch_row_by_uuid(cu: str):
-        rr = (
-            supabase.table(CHUNKS_TABLE)
-            .select("*")
-            .eq("chunk_uuid", cu)
-            .limit(1)
-            .execute()
-        )
-        return (rr.data or [None])[0]
-
-    # 5) Try same document with probability p_same
+    # Try same document first (probabilistically)
     if random.random() < p_same:
-        # Prefer unreviewed, exclude the current chunk
         unreviewed_other = [cu for cu in cu_list if cu not in reviewed and cu != chunk_uuid]
         pool = unreviewed_other or [cu for cu in cu_list if cu != chunk_uuid]
         if pool:
             return _fetch_row_by_uuid(random.choice(pool))
 
-    # 6) Else pick from other documents, biased to lower coverage (reuse our weighting helper)
-    #    Build a temporary dict excluding the current source
+    # Else choose other documents by low-coverage weighting
     other_sources = {s: lst for s, lst in source_to_chunks.items() if s != current_source and lst}
     if not other_sources:
-        # No other sources? fall back to same doc (excluding current)
+        # Fallback: only current doc available
         pool = [cu for cu in cu_list if cu != chunk_uuid]
         if not pool:
             return None
-        # Prefer unreviewed if any
         unreviewed_other = [cu for cu in pool if cu not in reviewed]
         pool = unreviewed_other or pool
         return _fetch_row_by_uuid(random.choice(pool))
 
-    chosen_source = _weighted_choice_by_coverage(other_sources, reviewed)
-    if not chosen_source:
-        # Fallback: uniform over all other chunks
-        flat_pool = [cu for s, lst in other_sources.items() for cu in lst]
+    chosen_other = _weighted_choice_by_coverage(other_sources, reviewed)
+    if not chosen_other:
+        # Uniform over all other chunks (prefer unreviewed)
+        flat_pool = [cu for lst in other_sources.values() for cu in lst]
         if not flat_pool:
             return None
-        # Prefer unreviewed
         unreviewed_pool = [cu for cu in flat_pool if cu not in reviewed]
         flat_pool = unreviewed_pool or flat_pool
         return _fetch_row_by_uuid(random.choice(flat_pool))
 
-    # Inside chosen other source, prefer unreviewed
-    other_cu_list = other_sources[chosen_source]
+    other_cu_list = other_sources[chosen_other]
     unreviewed_other = [cu for cu in other_cu_list if cu not in reviewed]
     target_uuid = random.choice(unreviewed_other) if unreviewed_other else random.choice(other_cu_list)
     return _fetch_row_by_uuid(target_uuid)
 
 
-def get_chunk_by_uuid(chunk_uuid: str):
+def get_chunk_by_uuid(chunk_uuid: str) -> Optional[dict]:
     """
-    Retrieve a single chunk by its UUID (column: chunk_uuid) from the flat table.
-    Returns dict or None.
+    Retrieve a single chunk by its UUID from the flat table.
+    Respects the run filter.
     """
     if not chunk_uuid:
         return None
-
-    resp = (
-        supabase.table(CHUNKS_TABLE)
-        .select("*")
-        .eq("chunk_uuid", chunk_uuid)
-        .limit(1)
-        .execute()
-    )
-    if resp.data:
-        return resp.data[0]
-    return None
+    return _fetch_row_by_uuid(chunk_uuid)
 
 
-def get_adjacent_chunk(chunk_uuid: str, direction: str = "next"):
+def get_adjacent_chunk(chunk_uuid: str, direction: str = "next") -> dict | bool:
     """
-    Given a chunk UUID, load the previous or next chunk
-    for the *same document* (same `source`) based on `chunk_number`.
+    Load the previous/next chunk for the *same document* (same `source`) based on `chunk_number`.
+    direction: "next" | "prev"
 
-    direction = "next"  → chunk_number + 1
-    direction = "prev"  → chunk_number - 1
-
-    Returns dict or False.
+    Returns: row dict or False.
     """
     if not chunk_uuid:
         return False
 
-    # Load current chunk info (flat columns, no JSON)
-    cur_resp = (
-        supabase.table(CHUNKS_TABLE)
-        .select("source, chunk_number")
-        .eq("chunk_uuid", chunk_uuid)
-        .limit(1)
-        .execute()
-    )
+    q = supabase.table(CHUNKS_TABLE).select("source, chunk_number").eq("chunk_uuid", chunk_uuid).limit(1)
+    q = _apply_run_filter(q)
+    cur_resp = q.execute()
     if not cur_resp.data:
         return False
 
-    current = cur_resp.data[0]
-    source = current.get("source")
-    chunk_number = current.get("chunk_number")
-
+    source = cur_resp.data[0].get("source")
+    chunk_number = cur_resp.data[0].get("chunk_number")
     if source is None or chunk_number is None:
         return False
 
@@ -305,81 +351,57 @@ def get_adjacent_chunk(chunk_uuid: str, direction: str = "next"):
     else:
         raise ValueError('direction must be "next" or "prev"')
 
-    # Fetch adjacent chunk within the same source
-    resp = (
-        supabase.table(CHUNKS_TABLE)
-        .select("*")
-        .eq("source", str(source))
-        .eq("chunk_number", target_num)
-        .limit(1)
-        .execute()
-    )
+    q2 = supabase.table(CHUNKS_TABLE).select("*").eq("source", str(source)).eq("chunk_number", target_num).limit(1)
+    q2 = _apply_run_filter(q2)
+    resp = q2.execute()
     if resp.data:
         return resp.data[0]
     return False
 
 
-def count_chunks_in_document(chunk_uuid: str):
+def count_chunks_in_document(chunk_uuid: str) -> int:
     """
-    Given a chunk UUID, return the total number of chunks
-    in the *same document* (same `source` column).
-
-    Returns an integer count, or 0 if not found.
+    Given a chunk UUID, return the total number of chunks in the *same document* (same `source`).
+    Respects the run filter.
     """
     if not chunk_uuid:
         return 0
 
-    # 1) Get source from the current chunk (flat column)
-    cur_resp = (
-        supabase.table(CHUNKS_TABLE)
-        .select("source")
-        .eq("chunk_uuid", chunk_uuid)
-        .limit(1)
-        .execute()
-    )
-    if not cur_resp.data:
+    q = supabase.table(CHUNKS_TABLE).select("source").eq("chunk_uuid", chunk_uuid).limit(1)
+    q = _apply_run_filter(q)
+    cur = q.execute()
+    if not cur.data:
         return 0
 
-    source = cur_resp.data[0].get("source")
+    source = cur.data[0].get("source")
     if not source:
         return 0
 
-    # 2) Count how many chunks share this source
-    count_resp = (
-        supabase.table(CHUNKS_TABLE)
-        .select("count", count="exact")
-        .eq("source", str(source))
-        .execute()
-    )
-    return getattr(count_resp, "count", 0) or 0
+    q2 = supabase.table(CHUNKS_TABLE).select("count", count="exact").eq("source", str(source))
+    q2 = _apply_run_filter(q2)
+    resp = q2.execute()
+    return getattr(resp, "count", 0) or 0
 
 
 # ---------- Reviews ----------
 
-def _to_bool(value):
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    s = str(value).strip().lower()
-    return s in {"yes", "y", "true", "1", "t"}
-
-
-def insert_chunk_review(form_payload: dict):
+def insert_chunk_review(form_payload: dict) -> dict:
     """
     Insert a review row from the Streamlit form payload.
-    Expected payload shape:
+
+    Expected:
     {
-      "chunk_uuid": "uuid-string",
-      "name": "Krzysiek",
-      "chunk_size": "too big",
-      "chunk_info": "missing information",
-      "has_well_diagram": "No",
-      "comment": "asdsad",
-      "observation": "dfghsfgh",
-      "well_assignment": ["the assigned well is not mentioned in the text"]
+      "chunk_uuid": "...",
+      "name": "...",
+      "chunk_size": "...",
+      "chunk_info": "...",
+      "has_well_diagram": "Yes"/True/False/None,
+      "comment": "...",
+      "observation": "...",
+      "well_assignment": [ ... ]  # list of strings
     }
-    Returns inserted row dict (or raises on error).
+
+    Returns inserted row dict.
     """
     if not form_payload or "chunk_uuid" not in form_payload:
         raise ValueError("chunk_uuid is required")
@@ -389,224 +411,182 @@ def insert_chunk_review(form_payload: dict):
         "name": form_payload.get("name"),
         "chunk_size": form_payload.get("chunk_size"),
         "chunk_info": form_payload.get("chunk_info"),
-        "has_well_diagram": _to_bool(form_payload.get("has_well_diagram")),
+        "has_well_diagram": _boolify(form_payload.get("has_well_diagram")),
         "comment": form_payload.get("comment"),
         "observation": form_payload.get("observation"),
         "well_assignment": form_payload.get("well_assignment") or [],
-        # inserted_at is server-side default (now()), no need to send
+        # inserted_at handled by DB default
     }
-
     resp = supabase.table(REVIEWS_TABLE).insert(row).execute()
     if not resp.data:
         raise RuntimeError("Insert failed with no data returned")
     return resp.data[0]
 
 
-# ---------- Counts & Stats ----------
+# ---------- Counts & Stats (scoped to current run) ----------
 
 def total_chunks() -> int:
-    """
-    Count all rows in document_chunks_flat.
-    Uses PostgREST exact count (efficient; no full fetch).
-    """
-    resp = supabase.table(CHUNKS_TABLE).select("count", count="exact").limit(1).execute()
-    return getattr(resp, "count", 0) or 0
+    """Count all rows in CHUNKS_TABLE for the current run."""
+    return _get_total_rows_for_chunks_where()
 
 
 def total_reviews() -> int:
     """
-    Count all rows in chunk_reviews.
-    Uses PostgREST exact count (efficient; no full fetch).
+    Count reviews for chunks that belong to the current run.
+    (Intersect REVIEWS_TABLE with the run's chunk_uuids.)
     """
-    resp = supabase.table(REVIEWS_TABLE).select("count", count="exact").limit(1).execute()
-    return getattr(resp, "count", 0) or 0
+    in_run = _fetch_all_chunk_uuids_in_run()
+    if not in_run:
+        return 0
+
+    total = 0
+    # Count in batches to avoid giant IN lists
+    in_run_list = list(in_run)
+    for i in range(0, len(in_run_list), _PAGE):
+        batch = in_run_list[i : i + _PAGE]
+        resp = (
+            supabase.table(REVIEWS_TABLE)
+            .select("count", count="exact")
+            .in_("chunk_uuid", batch)
+            .execute()
+        )
+        total += getattr(resp, "count", 0) or 0
+    return total
 
 
-def _distinct_chunk_count_in_reviews() -> int:
+def _distinct_chunk_count_in_reviews_for_run() -> int:
     """
-    Count how many DISTINCT chunk_uuid values appear in chunk_reviews.
+    Count DISTINCT reviewed chunk_uuid that belong to the current run.
     """
-    try:
-        resp = supabase.table(REVIEWS_TABLE).select("chunk_uuid", count="exact", distinct=True).execute()  # type: ignore
-        return getattr(resp, "count", None) or len({row["chunk_uuid"] for row in (resp.data or [])})
-    except Exception:
-        pass
+    in_run = _fetch_all_chunk_uuids_in_run()
+    if not in_run:
+        return 0
 
-    # Fallback: paginate and dedupe client-side
-    seen = set()
-    start = 0
-    while True:
-        page = supabase.table(REVIEWS_TABLE).select("chunk_uuid").range(start, start + _PAGE - 1).execute()
-        rows = page.data or []
-        if not rows:
-            break
-        for r in rows:
-            cu = r.get("chunk_uuid")
-            if cu:
-                seen.add(cu)
-        start += _PAGE
+    # If server supports distinct, we could try it —
+    # but we still must intersect with in_run, so client-side set is fine.
+    seen: Set[str] = set()
+    for r in _iter_all_review_rows(select_cols="chunk_uuid"):
+        cu = r.get("chunk_uuid")
+        if cu and cu in in_run:
+            seen.add(cu)
     return len(seen)
 
 
 def chunks_with_at_least_one_review() -> int:
-    """How many chunks have at least one review (distinct chunk_uuid in chunk_reviews)."""
-    return _distinct_chunk_count_in_reviews()
+    """
+    Number of CHUNKS (in current run) that have at least one review.
+    """
+    return _distinct_chunk_count_in_reviews_for_run()
 
 
 def reviewed_chunks_in_this_document(chunk_uuid: str) -> int:
     """
-    Given a chunk UUID, return how many chunks from the SAME document (same `source`)
-    have at least one review.
-
-    Strategy:
-      1) Find the `source` for the given chunk (from document_chunks_flat).
-      2) Get all chunk_uuids for that source from document_chunks_flat.
-      3) Query chunk_reviews for those chunk_uuids and count DISTINCT chunk_uuid.
+    For a given chunk_uuid, count how many chunks from the SAME document (same `source`)
+    have at least one review, restricted to the current run.
     """
     if not chunk_uuid:
         return 0
 
-    # Step 1: get source for this chunk
-    cur = (
-        supabase.table(CHUNKS_TABLE)
-        .select("source")
-        .eq("chunk_uuid", chunk_uuid)
-        .limit(1)
-        .execute()
-    )
+    # 1) Source of this chunk (scoped to run)
+    q = supabase.table(CHUNKS_TABLE).select("source").eq("chunk_uuid", chunk_uuid).limit(1)
+    q = _apply_run_filter(q)
+    cur = q.execute()
     if not cur.data:
         return 0
     source = cur.data[0].get("source")
     if not source:
         return 0
+    source = str(source)
 
-    # Step 2: collect all chunk_uuids in this document
-    doc_chunk_uuids = []
-    start = 0
-    while True:
-        page = (
-            supabase.table(CHUNKS_TABLE)
-            .select("chunk_uuid")
-            .eq("source", str(source))
-            .range(start, start + _PAGE - 1)
-            .execute()
-        )
-        rows = page.data or []
-        if not rows:
-            break
-        doc_chunk_uuids.extend([r["chunk_uuid"] for r in rows if r.get("chunk_uuid")])
-        start += _PAGE
-
+    # 2) All chunk_uuids in this doc (scoped to run)
+    doc_chunk_uuids: List[str] = []
+    for r in _iter_all_chunk_rows(select_cols="chunk_uuid", extra_filters=[("source", source)]):
+        cu = r.get("chunk_uuid")
+        if cu:
+            doc_chunk_uuids.append(cu)
     if not doc_chunk_uuids:
         return 0
 
-    # Step 3: fetch reviews for these chunk_uuids and count DISTINCT
-    distinct_reviewed = set()
+    # 3) DISTINCT chunk_uuid in reviews among those in this document
+    distinct_reviewed: Set[str] = set()
     for i in range(0, len(doc_chunk_uuids), _PAGE):
         batch = doc_chunk_uuids[i : i + _PAGE]
-        rev = (
-            supabase.table(REVIEWS_TABLE)
-            .select("chunk_uuid")
-            .in_("chunk_uuid", batch)
-            .execute()
-        )
+        rev = supabase.table(REVIEWS_TABLE).select("chunk_uuid").in_("chunk_uuid", batch).execute()
         for r in (rev.data or []):
             cu = r.get("chunk_uuid")
             if cu:
                 distinct_reviewed.add(cu)
-
     return len(distinct_reviewed)
 
 
 def total_documents() -> int:
     """
-    Count how many distinct documents there are.
-    A document is defined by the `source` column in document_chunks_flat.
+    Count distinct `source` values in CHUNKS_TABLE for the current run.
     """
     try:
-        resp = (
-            supabase
-            .table(CHUNKS_TABLE)
-            .select("source", count="exact", distinct=True)  # type: ignore
-            .execute()
-        )
+        q = supabase.table(CHUNKS_TABLE).select("source", count="exact", distinct=True)  # type: ignore
+        q = _apply_run_filter(q)
+        resp = q.execute()
         return getattr(resp, "count", None) or len({row["source"] for row in (resp.data or [])})
     except Exception:
         pass
 
-    # Fallback: fetch, dedupe
-    seen = set()
-    start = 0
-    while True:
-        page = (
-            supabase
-            .table(CHUNKS_TABLE)
-            .select("source")
-            .range(start, start + _PAGE - 1)
-            .execute()
-        )
-        rows = page.data or []
-        if not rows:
-            break
-        for r in rows:
-            val = r.get("source")
-            if val:
-                seen.add(val)
-        start += _PAGE
+    # Fallback: fetch and dedupe
+    seen: Set[str] = set()
+    for r in _iter_all_chunk_rows(select_cols="source"):
+        val = r.get("source")
+        if val:
+            seen.add(str(val))
     return len(seen)
 
 
 def documents_with_at_least_one_review() -> int:
     """
-    Return the number of distinct documents that have at least one reviewed chunk.
-    A document is identified by the `source` column (via document_chunks_flat).
+    Number of distinct documents (by `source`) in the current run that have
+    at least one reviewed chunk.
     """
-    reviewed_sources = set()
-    start = 0
+    # Collect all run-scoped chunk UUIDs -> source
+    uuid_to_source: Dict[str, str] = {}
+    for r in _iter_all_chunk_rows(select_cols="chunk_uuid,source"):
+        cu = r.get("chunk_uuid")
+        src = r.get("source")
+        if cu and src:
+            uuid_to_source[cu] = str(src)
 
-    while True:
-        # Get chunk_uuids that have reviews in batches
-        page = (
-            supabase.table(REVIEWS_TABLE)
-            .select("chunk_uuid")
-            .range(start, start + _PAGE - 1)
-            .execute()
-        )
-        rows = page.data or []
-        if not rows:
-            break
+    if not uuid_to_source:
+        return 0
 
-        chunk_uuids = [r["chunk_uuid"] for r in rows if r.get("chunk_uuid")]
-
-        # Fetch their sources in batches from the flat table
-        for i in range(0, len(chunk_uuids), _PAGE):
-            batch = chunk_uuids[i : i + _PAGE]
-            docs = (
-                supabase.table(CHUNKS_TABLE)
-                .select("source")
-                .in_("chunk_uuid", batch)
-                .execute()
-            )
-            for d in (docs.data or []):
-                src = d.get("source")
-                if src:
-                    reviewed_sources.add(src)
-
-        start += _PAGE
+    reviewed_sources: Set[str] = set()
+    for r in _iter_all_review_rows(select_cols="chunk_uuid"):
+        cu = r.get("chunk_uuid")
+        if cu in uuid_to_source:
+            reviewed_sources.add(uuid_to_source[cu])
 
     return len(reviewed_sources)
 
+
 def total_reviews_by_user(name: str) -> int:
     """
-    Count how many reviews a specific user has submitted.
+    Count reviews by user, restricted to the current run's chunks.
     """
     if not name:
         return 0
 
-    resp = (
-        supabase.table(REVIEWS_TABLE)
-        .select("count", count="exact")
-        .eq("name", name)
-        .execute()
-    )
-    return getattr(resp, "count", 0) or 0
+    in_run = _fetch_all_chunk_uuids_in_run()
+    if not in_run:
+        return 0
+
+    total = 0
+    uuids = list(in_run)
+    for i in range(0, len(uuids), _PAGE):
+        batch = uuids[i : i + _PAGE]
+        resp = (
+            supabase.table(REVIEWS_TABLE)
+            .select("count", count="exact")
+            .eq("name", name)
+            .in_("chunk_uuid", batch)
+            .execute()
+        )
+        total += getattr(resp, "count", 0) or 0
+    return total
+
