@@ -90,7 +90,7 @@ with tab_chunking:
                                             options=ChunkForm.WELL_ASSIGNMENT_OPTIONS, key="well_assignment", default=None)
                 chunk_info = st.selectbox("**Chunk Information**\n\nWhen compared to the original document, is the information here complete? Is anything missing or incorrectly included?", 
                                         options=ChunkForm.CHUNK_INFO_OPTIONS, key="chunk_info", index=None)
-                has_well_diagram = st.selectbox("**Includes Well Diagram?**\n\nDoes this part of the original document include a well diagram or visual reference that the model should recognize?", 
+                has_well_diagram = st.selectbox("**Includes Well Diagram?**\n\nDoes this part of the original document include a well diagram, information about well path or any visual reference that the model should recognize?", 
                                                 options=ChunkForm.WELL_DIAGRAM_OPTIONS, key="has_well_diagram", index=None)
 
                 comment = st.text_area("**Comment** (optional)", key="comment")
