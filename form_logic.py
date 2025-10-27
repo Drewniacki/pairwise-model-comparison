@@ -4,10 +4,11 @@ class ChunkForm:
     NAME_OPTIONS = ["Eva", "Gosia", "Krzysiek", "Tomek", "Michał", "Damian"]
     CHUNK_SIZE_OPTIONS = ["right", "too small", "too big"]
     WELL_ASSIGNMENT_OPTIONS = [
-        "correct well is assigned",
-        "the assigned well is not mentioned in the text",
-        "the well mentioned in the text is not assigned",
-        "assigned well is not an actuall well name"]
+        "correct well name is assigned",
+        "the assigned well name does not include sidetrack",
+        "the assigned well is not the well this part of the document refers to",
+        "the well this part of the document refers to is not assigned",
+        "what was automatically assigned is not an actuall well name"]
     CHUNK_INFO_OPTIONS = [
         "processed correctly", 
         "missing information", 

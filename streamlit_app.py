@@ -9,7 +9,6 @@ from drive import format_document_link
 st.title("Terrafusion25: assessing model outputs")
 
 # tabs
-
 tab_chunking, = st.tabs(["Chunking"])
 
 with tab_chunking:

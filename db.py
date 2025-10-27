@@ -44,7 +44,7 @@ def get_chunking_run_filter() -> Optional[Dict[str, str]]:
 
     By default: hard-coded example value; set to None if you don't need it.
     """
-    return {"chunking_run_id": "well_chunks_run0.1"}  # <— change or set to None
+    return {"chunking_run_id": "well_chunks_run1.1"}  # <— change or set to None
 
 
 def _apply_run_filter(q):
@@ -435,23 +435,18 @@ def total_reviews() -> int:
     Count reviews for chunks that belong to the current run.
     (Intersect REVIEWS_TABLE with the run's chunk_uuids.)
     """
-    in_run = _fetch_all_chunk_uuids_in_run()
-    if not in_run:
-        return 0
 
-    total = 0
-    # Count in batches to avoid giant IN lists
-    in_run_list = list(in_run)
-    for i in range(0, len(in_run_list), _PAGE):
-        batch = in_run_list[i : i + _PAGE]
-        resp = (
-            supabase.table(REVIEWS_TABLE)
-            .select("count", count="exact")
-            .in_("chunk_uuid", batch)
-            .execute()
-        )
-        total += getattr(resp, "count", 0) or 0
-    return total
+    # get function params
+    function_params = {"table_name": CHUNKS_TABLE}
+    run_filter = get_chunking_run_filter()
+    if run_filter:
+            function_params |= run_filter
+
+    # call function
+    resp = supabase.rpc("count_reviewed_chunks_for_run",function_params).execute()
+
+    # return the count
+    return resp.data
 
 
 def _distinct_chunk_count_in_reviews_for_run() -> int:
@@ -523,21 +518,17 @@ def total_documents() -> int:
     """
     Count distinct `source` values in CHUNKS_TABLE for the current run.
     """
-    try:
-        q = supabase.table(CHUNKS_TABLE).select("source", count="exact", distinct=True)  # type: ignore
-        q = _apply_run_filter(q)
-        resp = q.execute()
-        return getattr(resp, "count", None) or len({row["source"] for row in (resp.data or [])})
-    except Exception:
-        pass
+    # get function params
+    function_params = {"table_name": CHUNKS_TABLE}
+    run_filter = get_chunking_run_filter()
+    if run_filter:
+            function_params |= run_filter
 
-    # Fallback: fetch and dedupe
-    seen: Set[str] = set()
-    for r in _iter_all_chunk_rows(select_cols="source"):
-        val = r.get("source")
-        if val:
-            seen.add(str(val))
-    return len(seen)
+    # call function
+    resp = supabase.rpc("count_distinct_sources",function_params).execute()
+
+    # return the count
+    return resp.data
 
 
 def documents_with_at_least_one_review() -> int:
@@ -572,21 +563,15 @@ def total_reviews_by_user(name: str) -> int:
     if not name:
         return 0
 
-    in_run = _fetch_all_chunk_uuids_in_run()
-    if not in_run:
-        return 0
+    # get function params
+    function_params = {"table_name": CHUNKS_TABLE, "name": name}
+    run_filter = get_chunking_run_filter()
+    if run_filter:
+            function_params |= run_filter
 
-    total = 0
-    uuids = list(in_run)
-    for i in range(0, len(uuids), _PAGE):
-        batch = uuids[i : i + _PAGE]
-        resp = (
-            supabase.table(REVIEWS_TABLE)
-            .select("count", count="exact")
-            .eq("name", name)
-            .in_("chunk_uuid", batch)
-            .execute()
-        )
-        total += getattr(resp, "count", 0) or 0
-    return total
+    # call function
+    resp = supabase.rpc("count_reviewed_chunks_for_user",function_params).execute()
+
+    # return the count
+    return resp.data
 
