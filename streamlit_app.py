@@ -34,6 +34,22 @@ with tab_chunking:
         # present chunk information
         with left_panel:
             st.subheader("Chunk", divider="orange")
+
+            source_title = "##### Document source"
+            if ChunkForm.is_submitted_correctly():
+                if chunk['source'] == get_chunk_by_uuid(st.session_state.submitted["chunk_uuid"])['source']:
+                    source_title += " :blue-badge[Same as previously assessed]"
+                else:
+                    source_title += " :red-badge[New document source!]"
+            st.markdown(source_title)
+            st.write(format_document_link(chunk))
+
+            st.markdown("##### Assigned wells")
+            if chunk['has_well']:
+                for well in chunk['wells']:
+                    st.markdown('- '+well)
+            else:
+                st.write('*None*')
             
             previous_chunk = get_adjacent_chunk(st.session_state.chunk_uuid, direction = "prev")
             if previous_chunk:
@@ -50,22 +66,6 @@ with tab_chunking:
             if next_chunk:
                 with st.expander("next chunk:  *[for info only]*"):
                     st.code(next_chunk["text"], language="text")
-
-            st.markdown("##### Assigned wells")
-            if chunk['has_well']:
-                for well in chunk['wells']:
-                    st.markdown('- '+well)
-            else:
-                st.write('*None*')
-
-            source_title = "##### Document source"
-            if ChunkForm.is_submitted_correctly():
-                if chunk['source'] == get_chunk_by_uuid(st.session_state.submitted["chunk_uuid"])['source']:
-                    source_title += " :blue-badge[Same as previously assessed]"
-                else:
-                    source_title += " :red-badge[New document source!]"
-            st.markdown(source_title)
-            st.write(format_document_link(chunk))
 
             st.markdown("##### Metadata")
             st.json({k: v for k, v in chunk.items() if k != "text"}, expanded=False)
